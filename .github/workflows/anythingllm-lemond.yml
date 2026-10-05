@@ -16,8 +16,8 @@ name: AnythingLLM lemond builds
 #     the build does not depend on which Visual Studio version an image ships.
 #   - Run manually only, with one checkbox per target (all on by default). Archives are left as
 #     job artifacts (5 day retention).
-#   - Archives are repackaged as lemond-<version>-<platform>.<ext> since the upstream embeddable
-#     target names every Windows build "windows-x64".
+#   - Builds only the lemond target (not the lemonade CLI or the upstream `embeddable` target) and
+#     packages lemond + LICENSE + the resource files as lemond-<version>-<platform>.<ext>.
 
 on:
   workflow_dispatch:
@@ -62,9 +62,15 @@ env:
   LEMONADE_DISABLE_SYSTEMD_JOURNAL: "1"
   # Highest glibc symbol version the Linux binaries may require (Ubuntu 22.04)
   MAX_GLIBC: "2.35"
+  # Resource files shipped next to lemond (same set the upstream embeddable target packs)
+  RESOURCES: >-
+    defaults.json backend_versions.json server_models.json
+    toolDefinitions.json vllm_model_config.json bench_scenarios.json
 
 jobs:
-  # Turns the per-target checkboxes into one matrix per OS job; an OS job with nothing selected is skipped.
+  # Turns the per-target checkboxes into a platform list per OS job; an OS job with nothing selected is
+  # skipped. Only `platform` is in each matrix so job names read e.g. "Linux (linux-x64)" - runner, arch
+  # and machine are looked up from it.
   targets:
     name: Select targets
     runs-on: ubuntu-latest
@@ -84,12 +90,10 @@ jobs:
         run: |
           set -e
           pick() { if [ "$1" = "true" ]; then echo "$2"; fi; }
-          linux=$( { pick "$LINUX_X64" '{"platform":"linux-x64","runs-on":"ubuntu-22.04"}'
-                     pick "$LINUX_ARM64" '{"platform":"linux-arm64","runs-on":"ubuntu-22.04-arm"}'; } | jq -sc .)
-          macos=$( { pick "$MACOS_ARM64" '{"platform":"macos-arm64","runs-on":"macos-15","arch":"arm64"}'
-                     pick "$MACOS_X64" '{"platform":"macos-x64","runs-on":"macos-15-intel","arch":"x86_64"}'; } | jq -sc .)
-          windows=$( { pick "$WINDOWS_X64" '{"platform":"windows-x64","runs-on":"windows-latest","arch":"x64","machine":"8664"}'
-                       pick "$WINDOWS_ARM64" '{"platform":"windows-arm64","runs-on":"windows-11-arm","arch":"arm64","machine":"AA64"}'; } | jq -sc .)
+          list() { jq -nc '$ARGS.positional' --args "$@"; }
+          linux=$(list $(pick "$LINUX_X64" linux-x64) $(pick "$LINUX_ARM64" linux-arm64))
+          macos=$(list $(pick "$MACOS_ARM64" macos-arm64) $(pick "$MACOS_X64" macos-x64))
+          windows=$(list $(pick "$WINDOWS_X64" windows-x64) $(pick "$WINDOWS_ARM64" windows-arm64))
           if [ "$linux$macos$windows" = "[][][]" ]; then
             echo "ERROR: no targets selected"; exit 1
           fi
@@ -98,14 +102,14 @@ jobs:
           echo "windows=$windows" | tee -a "$GITHUB_OUTPUT"
 
   linux:
-    name: Linux ${{ matrix.platform }}
+    name: Linux
     needs: targets
     if: ${{ needs.targets.outputs.linux != '[]' }}
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ${{ fromJSON('{"linux-x64":"ubuntu-22.04","linux-arm64":"ubuntu-22.04-arm"}')[matrix.platform] }}
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.targets.outputs.linux) }}
+        platform: ${{ fromJSON(needs.targets.outputs.linux) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -140,41 +144,44 @@ jobs:
           cmake --version
           g++ --version
 
-      - name: Build embeddable
+      - name: Build lemond
         run: |
           set -e
           cmake --preset default -DBUILD_WEB_APP=OFF \
             -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
-          cmake --build --preset default --target embeddable
+          cmake --build --preset default --target lemond
+
+      - name: Stage
+        run: |
+          set -e
+          NAME="lemond-${LEMONADE_VERSION}-${{ matrix.platform }}"
+          mkdir -p "dist/$NAME/resources"
+          cp build/lemond LICENSE "dist/$NAME/"
+          for r in $RESOURCES; do cp "build/resources/$r" "dist/$NAME/resources/"; done
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+          find "dist/$NAME" -type f
 
       - name: Verify portability
         run: |
           set -e
-          STAGING=$(ls -d build/lemonade-embeddable-*/ | head -1)
-          for f in "$STAGING/lemond" "$STAGING/lemonade"; do
-            echo "== $f"
-            file "$f"
-            readelf -d "$f" | grep NEEDED
-            if readelf -d "$f" | grep -q 'libstdc++'; then
-              echo "ERROR: $f dynamically links libstdc++"; exit 1
-            fi
-            max=$(objdump -T "$f" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -uV | tail -1)
-            echo "Max glibc symbol: $max (limit $MAX_GLIBC)"
-            if [ "$(printf '%s\n%s\n' "$max" "$MAX_GLIBC" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
-              echo "ERROR: $f requires glibc $max > $MAX_GLIBC"; exit 1
-            fi
-          done
-          "$STAGING/lemond" --version
+          f="dist/$NAME/lemond"
+          file "$f"
+          readelf -d "$f" | grep NEEDED
+          if readelf -d "$f" | grep -q 'libstdc++'; then
+            echo "ERROR: $f dynamically links libstdc++"; exit 1
+          fi
+          max=$(objdump -T "$f" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "Max glibc symbol: $max (limit $MAX_GLIBC)"
+          if [ "$(printf '%s\n%s\n' "$max" "$MAX_GLIBC" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
+            echo "ERROR: $f requires glibc $max > $MAX_GLIBC"; exit 1
+          fi
+          "$f" --version
 
       - name: Package
         run: |
           set -e
-          STAGING=$(ls -d build/lemonade-embeddable-*/ | head -1)
-          NAME="lemond-${LEMONADE_VERSION}-${{ matrix.platform }}"
-          mkdir -p dist
-          cp -r "$STAGING" "dist/$NAME"
           tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
-          ls -lh "dist/$NAME.tar.gz"
+          tar -tzvf "dist/$NAME.tar.gz"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -183,15 +190,16 @@ jobs:
           retention-days: 5
 
   macos:
-    name: macOS ${{ matrix.platform }}
+    name: macOS
     needs: targets
     if: ${{ needs.targets.outputs.macos != '[]' }}
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ${{ fromJSON('{"macos-arm64":"macos-15","macos-x64":"macos-15-intel"}')[matrix.platform] }}
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.targets.outputs.macos) }}
+        platform: ${{ fromJSON(needs.targets.outputs.macos) }}
     env:
+      ARCH: ${{ matrix.platform == 'macos-arm64' && 'arm64' || 'x86_64' }}
       MACOSX_DEPLOYMENT_TARGET: ${{ inputs.macos_deployment_target }}
     steps:
       - uses: actions/checkout@v4
@@ -217,42 +225,45 @@ jobs:
             brew install ninja
           fi
 
-      - name: Build embeddable
+      - name: Build lemond
         run: |
           set -e
           cmake --preset default -DBUILD_WEB_APP=OFF \
-            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_OSX_ARCHITECTURES=$ARCH \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ inputs.macos_deployment_target }}
-          cmake --build --preset default --target embeddable
+          cmake --build --preset default --target lemond
 
-      - name: Verify binaries
+      - name: Stage
         run: |
           set -e
-          STAGING=$(ls -d build/lemonade-embeddable-*/ | head -1)
-          for f in "$STAGING/lemond" "$STAGING/lemonade"; do
-            echo "== $f"
-            file "$f"
-            otool -L "$f"
-            minos=$(otool -l "$f" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
-            echo "minos: $minos (expected $MACOSX_DEPLOYMENT_TARGET)"
-            if [ "$minos" != "$MACOSX_DEPLOYMENT_TARGET" ]; then
-              echo "ERROR: $f has minos $minos"; exit 1
-            fi
-            if otool -L "$f" | grep -E '/(opt/homebrew|usr/local)/'; then
-              echo "ERROR: $f links Homebrew libraries"; exit 1
-            fi
-          done
-          "$STAGING/lemond" --version
+          NAME="lemond-${LEMONADE_VERSION}-${{ matrix.platform }}"
+          mkdir -p "dist/$NAME/resources"
+          cp build/lemond LICENSE "dist/$NAME/"
+          for r in $RESOURCES; do cp "build/resources/$r" "dist/$NAME/resources/"; done
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+          find "dist/$NAME" -type f
+
+      - name: Verify binary
+        run: |
+          set -e
+          f="dist/$NAME/lemond"
+          file "$f"
+          otool -L "$f"
+          minos=$(otool -l "$f" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+          echo "minos: $minos (expected $MACOSX_DEPLOYMENT_TARGET)"
+          if [ "$minos" != "$MACOSX_DEPLOYMENT_TARGET" ]; then
+            echo "ERROR: $f has minos $minos"; exit 1
+          fi
+          if otool -L "$f" | grep -E '/(opt/homebrew|usr/local)/'; then
+            echo "ERROR: $f links Homebrew libraries"; exit 1
+          fi
+          "$f" --version
 
       - name: Package
         run: |
           set -e
-          STAGING=$(ls -d build/lemonade-embeddable-*/ | head -1)
-          NAME="lemond-${LEMONADE_VERSION}-${{ matrix.platform }}"
-          mkdir -p dist
-          cp -R "$STAGING" "dist/$NAME"
-          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
-          ls -lh "dist/$NAME.tar.gz"
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          tar -tzvf "dist/$NAME.tar.gz"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -261,14 +272,18 @@ jobs:
           retention-days: 5
 
   windows:
-    name: Windows ${{ matrix.platform }}
+    name: Windows
     needs: targets
     if: ${{ needs.targets.outputs.windows != '[]' }}
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ${{ fromJSON('{"windows-x64":"windows-latest","windows-arm64":"windows-11-arm"}')[matrix.platform] }}
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.targets.outputs.windows) }}
+        platform: ${{ fromJSON(needs.targets.outputs.windows) }}
+    env:
+      ARCH: ${{ matrix.platform == 'windows-arm64' && 'arm64' || 'x64' }}
+      # dumpbin machine type
+      MACHINE: ${{ matrix.platform == 'windows-arm64' && 'AA64' || '8664' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -286,10 +301,10 @@ jobs:
       - name: Get Lemonade version
         uses: ./.github/actions/get-version
 
-      - name: Set up MSVC (${{ matrix.arch }})
+      - name: Set up MSVC (${{ env.ARCH }})
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: ${{ matrix.arch }}
+          arch: ${{ env.ARCH }}
 
       - name: Ensure CMake and Ninja
         shell: pwsh
@@ -303,40 +318,43 @@ jobs:
           cmake --version
           ninja --version
 
-      - name: Build embeddable
+      - name: Build lemond
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_WEB_APP=OFF
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build build --target embeddable -- -k 0 # report every compile error, not just the first
+          cmake --build build --target lemond -- -k 0 # report every compile error, not just the first
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Verify binaries
+      - name: Stage
+        shell: bash
+        run: |
+          set -e
+          NAME="lemond-${LEMONADE_VERSION}-${{ matrix.platform }}"
+          mkdir -p "dist/$NAME/resources"
+          cp build/lemond.exe LICENSE "dist/$NAME/"
+          for r in $RESOURCES; do cp "build/resources/$r" "dist/$NAME/resources/"; done
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+          find "dist/$NAME" -type f
+
+      - name: Verify binary
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $staging = Get-ChildItem build -Directory -Filter "lemonade-embeddable-*" | Select-Object -First 1
-          foreach ($exe in @("lemond.exe", "lemonade.exe")) {
-            $path = Join-Path $staging.FullName $exe
-            Write-Host "== $path"
-            $headers = dumpbin /headers $path | Out-String
-            if ($headers -notmatch "${{ matrix.machine }} machine") { throw "$exe is not a ${{ matrix.arch }} binary" }
-            dumpbin /dependents $path
-          }
-          & (Join-Path $staging.FullName "lemond.exe") --version
+          $path = "dist\$($env:NAME)\lemond.exe"
+          $headers = dumpbin /headers $path | Out-String
+          if ($headers -notmatch "$($env:MACHINE) machine") { throw "lemond.exe is not a $($env:ARCH) binary" }
+          dumpbin /dependents $path
+          & $path --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $staging = Get-ChildItem build -Directory -Filter "lemonade-embeddable-*" | Select-Object -First 1
-          $name = "lemond-$($env:LEMONADE_VERSION)-${{ matrix.platform }}"
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item -Recurse $staging.FullName "dist\$name"
-          Compress-Archive -Path "dist\$name" -DestinationPath "dist\$name.zip"
-          Get-Item "dist\$name.zip"
+          Compress-Archive -Path "dist\$($env:NAME)" -DestinationPath "dist\$($env:NAME).zip"
+          Get-Item "dist\$($env:NAME).zip"
 
       - uses: actions/upload-artifact@v4
         with:
