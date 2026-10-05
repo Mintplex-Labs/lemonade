@@ -1,0 +1,280 @@
+name: AnythingLLM lemond builds
+
+# Builds the lemond/lemonade embeddable binaries for every platform AnythingLLM Desktop ships:
+#   macos-arm64, macos-x64, windows-x64, windows-arm64, linux-x64, linux-arm64
+#
+# Builds an upstream lemonade-sdk/lemonade ref as-is (no source patches). Differences from the
+# upstream embeddable jobs:
+#   - Linux builds on Ubuntu 22.04 (glibc 2.35) with libstdc++/libgcc linked statically so the
+#     binary runs on Ubuntu 22.04+, Debian 12+, RHEL 9+. OpenSSL stays dynamic (libssl.so.3) so
+#     the distro's CA store/config is used.
+#   - macOS pins the deployment target so the binary is not locked to the runner's macOS version.
+#     Binaries are unsigned - electron-builder signs/notarizes them inside the .app.
+#   - Windows ARM64 is built natively on windows-11-arm. Windows uses Ninja + the MSVC dev env so
+#     the build does not depend on which Visual Studio version an image ships.
+#   - Run manually only; archives are left as job artifacts (5 day retention).
+#   - Archives are repackaged as lemond-<version>-<platform>.<ext> since the upstream embeddable
+#     target names every Windows build "windows-x64".
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "lemonade ref (tag/branch/sha) to build"
+        required: true
+        default: "v2026.40.0"
+      source_repo:
+        description: "Repository to build from"
+        required: true
+        default: "lemonade-sdk/lemonade"
+      macos_deployment_target:
+        description: "Minimum macOS version (Electron 31 supports 11.0+)"
+        required: true
+        default: "11.0"
+
+permissions:
+  contents: read
+
+env:
+  LEMONADE_DISABLE_SYSTEMD_JOURNAL: "1"
+  # Highest glibc symbol version the Linux binaries may require (Ubuntu 22.04)
+  MAX_GLIBC: "2.35"
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.platform }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runs-on: ubuntu-22.04
+          - platform: linux-arm64
+            runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0 # tools/version.py derives the version from tags
+
+      - name: Get Lemonade version
+        uses: ./.github/actions/get-version
+
+      - name: Install build dependencies
+        run: |
+          set -e
+          success=false
+          for i in 1 2 3; do
+            if sudo apt-get update && \
+                sudo apt-get install -y ninja-build g++ pkg-config libssl-dev libdrm-dev; then
+              success=true
+              break
+            fi
+            echo "apt-get failed (attempt $i/3), retrying..."
+            sleep 10
+          done
+          $success
+          cmake --version
+          g++ --version
+
+      - name: Build embeddable
+        run: |
+          set -e
+          cmake --preset default -DBUILD_WEB_APP=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+          cmake --build --preset default --target embeddable
+
+      - name: Verify portability
+        run: |
+          set -e
+          STAGING=$(ls -d build/lemonade-embeddable-*/ | head -1)
+          for f in "$STAGING/lemond" "$STAGING/lemonade"; do
+            echo "== $f"
+            file "$f"
+            readelf -d "$f" | grep NEEDED
+            if readelf -d "$f" | grep -q 'libstdc++'; then
+              echo "ERROR: $f dynamically links libstdc++"; exit 1
+            fi
+            max=$(objdump -T "$f" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -uV | tail -1)
+            echo "Max glibc symbol: $max (limit $MAX_GLIBC)"
+            if [ "$(printf '%s\n%s\n' "$max" "$MAX_GLIBC" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
+              echo "ERROR: $f requires glibc $max > $MAX_GLIBC"; exit 1
+            fi
+          done
+          "$STAGING/lemond" --version
+
+      - name: Package
+        run: |
+          set -e
+          STAGING=$(ls -d build/lemonade-embeddable-*/ | head -1)
+          NAME="lemond-${LEMONADE_VERSION}-${{ matrix.platform }}"
+          mkdir -p dist
+          cp -r "$STAGING" "dist/$NAME"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          ls -lh "dist/$NAME.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lemond-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          retention-days: 5
+
+  macos:
+    name: macOS ${{ matrix.platform }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runs-on: macos-15
+            arch: arm64
+          - platform: macos-x64
+            runs-on: macos-15-intel
+            arch: x86_64
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ inputs.macos_deployment_target }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Get Lemonade version
+        uses: ./.github/actions/get-version
+
+      - name: Install build dependencies
+        run: |
+          set -e
+          if ! command -v ninja >/dev/null 2>&1; then
+            brew install ninja
+          fi
+
+      - name: Build embeddable
+        run: |
+          set -e
+          cmake --preset default -DBUILD_WEB_APP=OFF \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ inputs.macos_deployment_target }}
+          cmake --build --preset default --target embeddable
+
+      - name: Verify binaries
+        run: |
+          set -e
+          STAGING=$(ls -d build/lemonade-embeddable-*/ | head -1)
+          for f in "$STAGING/lemond" "$STAGING/lemonade"; do
+            echo "== $f"
+            file "$f"
+            otool -L "$f"
+            minos=$(otool -l "$f" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+            echo "minos: $minos (expected $MACOSX_DEPLOYMENT_TARGET)"
+            if [ "$minos" != "$MACOSX_DEPLOYMENT_TARGET" ]; then
+              echo "ERROR: $f has minos $minos"; exit 1
+            fi
+            if otool -L "$f" | grep -E '/(opt/homebrew|usr/local)/'; then
+              echo "ERROR: $f links Homebrew libraries"; exit 1
+            fi
+          done
+          "$STAGING/lemond" --version
+
+      - name: Package
+        run: |
+          set -e
+          STAGING=$(ls -d build/lemonade-embeddable-*/ | head -1)
+          NAME="lemond-${LEMONADE_VERSION}-${{ matrix.platform }}"
+          mkdir -p dist
+          cp -R "$STAGING" "dist/$NAME"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          ls -lh "dist/$NAME.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lemond-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          retention-days: 5
+
+  windows:
+    name: Windows ${{ matrix.platform }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runs-on: windows-latest
+            arch: x64
+            machine: "8664"
+          - platform: windows-arm64
+            runs-on: windows-11-arm
+            arch: arm64
+            machine: "AA64"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Get Lemonade version
+        uses: ./.github/actions/get-version
+
+      - name: Set up MSVC (${{ matrix.arch }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Ensure CMake and Ninja
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            python -m pip install ninja
+          }
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            python -m pip install cmake
+          }
+          cmake --version
+          ninja --version
+
+      - name: Build embeddable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_WEB_APP=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --target embeddable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $staging = Get-ChildItem build -Directory -Filter "lemonade-embeddable-*" | Select-Object -First 1
+          foreach ($exe in @("lemond.exe", "lemonade.exe")) {
+            $path = Join-Path $staging.FullName $exe
+            Write-Host "== $path"
+            $headers = dumpbin /headers $path | Out-String
+            if ($headers -notmatch "${{ matrix.machine }} machine") { throw "$exe is not a ${{ matrix.arch }} binary" }
+            dumpbin /dependents $path
+          }
+          & (Join-Path $staging.FullName "lemond.exe") --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $staging = Get-ChildItem build -Directory -Filter "lemonade-embeddable-*" | Select-Object -First 1
+          $name = "lemond-$($env:LEMONADE_VERSION)-${{ matrix.platform }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item -Recurse $staging.FullName "dist\$name"
+          Compress-Archive -Path "dist\$name" -DestinationPath "dist\$name.zip"
+          Get-Item "dist\$name.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lemond-${{ matrix.platform }}
+          path: dist/*.zip
+          retention-days: 5
