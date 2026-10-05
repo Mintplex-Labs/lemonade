@@ -3,7 +3,9 @@ name: AnythingLLM lemond builds
 # Builds the lemond/lemonade embeddable binaries for every platform AnythingLLM Desktop ships:
 #   macos-arm64, macos-x64, windows-x64, windows-arm64, linux-x64, linux-arm64
 #
-# Builds an upstream lemonade-sdk/lemonade ref as-is (no source patches). Differences from the
+# Builds this fork at whichever branch the run is dispatched from. The fork carries no tags, so
+# pass `version` to stamp a real version (written to .version, which tools/version.py prefers);
+# otherwise the build gets a dev version (YYYY.WW.0~<count>.<hash>). Differences from the
 # upstream embeddable jobs:
 #   - Linux builds on Ubuntu 22.04 (glibc 2.35) with libstdc++/libgcc linked statically so the
 #     binary runs on Ubuntu 22.04+, Debian 12+, RHEL 9+. OpenSSL stays dynamic (libssl.so.3) so
@@ -19,14 +21,10 @@ name: AnythingLLM lemond builds
 on:
   workflow_dispatch:
     inputs:
-      ref:
-        description: "lemonade ref (tag/branch/sha) to build"
-        required: true
-        default: "v2026.40.0"
-      source_repo:
-        description: "Repository to build from"
-        required: true
-        default: "lemonade-sdk/lemonade"
+      version:
+        description: "Version to stamp, must start with X.Y.Z, e.g. 2026.40.0 (blank = dev version from git)"
+        required: false
+        default: ""
       macos_deployment_target:
         description: "Minimum macOS version (Electron 31 supports 11.0+)"
         required: true
@@ -55,9 +53,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.source_repo }}
-          ref: ${{ inputs.ref }}
-          fetch-depth: 0 # tools/version.py derives the version from tags
+          fetch-depth: 0 # dev versions count commits
+
+      - name: Stamp version
+        if: ${{ inputs.version != '' }}
+        shell: bash
+        run: |
+          if ! [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "ERROR: version must start with X.Y.Z (got '${{ inputs.version }}')"; exit 1
+          fi
+          echo "${{ inputs.version }}" > .version
 
       - name: Get Lemonade version
         uses: ./.github/actions/get-version
@@ -139,9 +144,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.source_repo }}
-          ref: ${{ inputs.ref }}
-          fetch-depth: 0
+          fetch-depth: 0 # dev versions count commits
+
+      - name: Stamp version
+        if: ${{ inputs.version != '' }}
+        shell: bash
+        run: |
+          if ! [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "ERROR: version must start with X.Y.Z (got '${{ inputs.version }}')"; exit 1
+          fi
+          echo "${{ inputs.version }}" > .version
 
       - name: Get Lemonade version
         uses: ./.github/actions/get-version
@@ -214,9 +226,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.source_repo }}
-          ref: ${{ inputs.ref }}
-          fetch-depth: 0
+          fetch-depth: 0 # dev versions count commits
+
+      - name: Stamp version
+        if: ${{ inputs.version != '' }}
+        shell: bash
+        run: |
+          if ! [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "ERROR: version must start with X.Y.Z (got '${{ inputs.version }}')"; exit 1
+          fi
+          echo "${{ inputs.version }}" > .version
 
       - name: Get Lemonade version
         uses: ./.github/actions/get-version
