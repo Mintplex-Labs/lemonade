@@ -402,6 +402,11 @@ if(NOT USE_SYSTEM_CURL)
     set(CURL_DISABLE_TESTS ON CACHE INTERNAL "")
     set(CURL_DISABLE_INSTALL ON CACHE INTERNAL "")
     set(HTTP_ONLY ON CACHE INTERNAL "")
+    # These default ON and link whatever the build machine has (e.g. Homebrew's /usr/local on
+    # Intel macOS runners), producing binaries that fail on machines without them.
+    set(USE_LIBIDN2 OFF CACHE INTERNAL "")
+    set(CURL_USE_LIBPSL OFF CACHE INTERNAL "")
+    set(CURL_USE_LIBSSH2 OFF CACHE INTERNAL "")
     if(WIN32)
         set(CURL_STATIC_CRT ON CACHE INTERNAL "")
         set(CURL_USE_SCHANNEL ON CACHE INTERNAL "")
@@ -772,6 +777,8 @@ if(WIN32)
         add_compile_options(/guard:cf)
         # Buffer Security Check - stack buffer overflow detection
         add_compile_options(/GS)
+        # server.cpp exceeds the default COFF section limit on ARM64
+        add_compile_options(/bigobj)
         # MSBuild parallelizes across projects, but within one project cl.exe
         # compiles a single file at a time, which leaves most cores idle.
         # Ninja already schedules per file, so /MP would oversubscribe there.

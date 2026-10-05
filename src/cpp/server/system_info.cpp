@@ -2618,6 +2618,7 @@ WindowsSystemInfo::WindowsSystemInfo() {
 static WindowsSystemInfo::CpuHardware read_cpu_hardware() {
     WindowsSystemInfo::CpuHardware hw;
 
+#if defined(_M_X64) || defined(_M_IX86)
     // Brand string via CPUID leaves 0x80000002-4
     char brand[49] = {};
     int cpui[4] = {};
@@ -2627,6 +2628,15 @@ static WindowsSystemInfo::CpuHardware read_cpu_hardware() {
     }
     brand[48] = '\0';
     hw.brand = brand;
+#else
+    // No CPUID on ARM64 - use the processor name Windows reports
+    char brand[256] = {};
+    DWORD brand_size = sizeof(brand);
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                     "ProcessorNameString", RRF_RT_REG_SZ, nullptr, brand, &brand_size) == ERROR_SUCCESS) {
+        hw.brand = brand;
+    }
+#endif
     size_t start = hw.brand.find_first_not_of(" \t");
     size_t end   = hw.brand.find_last_not_of(" \t");
     if (start != std::string::npos) {

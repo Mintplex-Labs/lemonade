@@ -14,7 +14,8 @@ name: AnythingLLM lemond builds
 #     Binaries are unsigned - electron-builder signs/notarizes them inside the .app.
 #   - Windows ARM64 is built natively on windows-11-arm. Windows uses Ninja + the MSVC dev env so
 #     the build does not depend on which Visual Studio version an image ships.
-#   - Run manually only; archives are left as job artifacts (5 day retention).
+#   - Run manually only, with one checkbox per target (all on by default). Archives are left as
+#     job artifacts (5 day retention).
 #   - Archives are repackaged as lemond-<version>-<platform>.<ext> since the upstream embeddable
 #     target names every Windows build "windows-x64".
 
@@ -29,6 +30,30 @@ on:
         description: "Minimum macOS version (Electron 31 supports 11.0+)"
         required: true
         default: "11.0"
+      macos_arm64:
+        description: "Build macos-arm64"
+        type: boolean
+        default: true
+      macos_x64:
+        description: "Build macos-x64"
+        type: boolean
+        default: true
+      windows_x64:
+        description: "Build windows-x64"
+        type: boolean
+        default: true
+      windows_arm64:
+        description: "Build windows-arm64"
+        type: boolean
+        default: true
+      linux_x64:
+        description: "Build linux-x64"
+        type: boolean
+        default: true
+      linux_arm64:
+        description: "Build linux-arm64"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -39,17 +64,48 @@ env:
   MAX_GLIBC: "2.35"
 
 jobs:
+  # Turns the per-target checkboxes into one matrix per OS job; an OS job with nothing selected is skipped.
+  targets:
+    name: Select targets
+    runs-on: ubuntu-latest
+    outputs:
+      linux: ${{ steps.select.outputs.linux }}
+      macos: ${{ steps.select.outputs.macos }}
+      windows: ${{ steps.select.outputs.windows }}
+    steps:
+      - id: select
+        env:
+          MACOS_ARM64: ${{ inputs.macos_arm64 }}
+          MACOS_X64: ${{ inputs.macos_x64 }}
+          WINDOWS_X64: ${{ inputs.windows_x64 }}
+          WINDOWS_ARM64: ${{ inputs.windows_arm64 }}
+          LINUX_X64: ${{ inputs.linux_x64 }}
+          LINUX_ARM64: ${{ inputs.linux_arm64 }}
+        run: |
+          set -e
+          pick() { if [ "$1" = "true" ]; then echo "$2"; fi; }
+          linux=$( { pick "$LINUX_X64" '{"platform":"linux-x64","runs-on":"ubuntu-22.04"}'
+                     pick "$LINUX_ARM64" '{"platform":"linux-arm64","runs-on":"ubuntu-22.04-arm"}'; } | jq -sc .)
+          macos=$( { pick "$MACOS_ARM64" '{"platform":"macos-arm64","runs-on":"macos-15","arch":"arm64"}'
+                     pick "$MACOS_X64" '{"platform":"macos-x64","runs-on":"macos-15-intel","arch":"x86_64"}'; } | jq -sc .)
+          windows=$( { pick "$WINDOWS_X64" '{"platform":"windows-x64","runs-on":"windows-latest","arch":"x64","machine":"8664"}'
+                       pick "$WINDOWS_ARM64" '{"platform":"windows-arm64","runs-on":"windows-11-arm","arch":"arm64","machine":"AA64"}'; } | jq -sc .)
+          if [ "$linux$macos$windows" = "[][][]" ]; then
+            echo "ERROR: no targets selected"; exit 1
+          fi
+          echo "linux=$linux" | tee -a "$GITHUB_OUTPUT"
+          echo "macos=$macos" | tee -a "$GITHUB_OUTPUT"
+          echo "windows=$windows" | tee -a "$GITHUB_OUTPUT"
+
   linux:
     name: Linux ${{ matrix.platform }}
+    needs: targets
+    if: ${{ needs.targets.outputs.linux != '[]' }}
     runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: linux-x64
-            runs-on: ubuntu-22.04
-          - platform: linux-arm64
-            runs-on: ubuntu-22.04-arm
+        include: ${{ fromJSON(needs.targets.outputs.linux) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -128,17 +184,13 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.platform }}
+    needs: targets
+    if: ${{ needs.targets.outputs.macos != '[]' }}
     runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: macos-arm64
-            runs-on: macos-15
-            arch: arm64
-          - platform: macos-x64
-            runs-on: macos-15-intel
-            arch: x86_64
+        include: ${{ fromJSON(needs.targets.outputs.macos) }}
     env:
       MACOSX_DEPLOYMENT_TARGET: ${{ inputs.macos_deployment_target }}
     steps:
@@ -210,19 +262,13 @@ jobs:
 
   windows:
     name: Windows ${{ matrix.platform }}
+    needs: targets
+    if: ${{ needs.targets.outputs.windows != '[]' }}
     runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: windows-x64
-            runs-on: windows-latest
-            arch: x64
-            machine: "8664"
-          - platform: windows-arm64
-            runs-on: windows-11-arm
-            arch: arm64
-            machine: "AA64"
+        include: ${{ fromJSON(needs.targets.outputs.windows) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -263,7 +309,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_WEB_APP=OFF
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build build --target embeddable
+          cmake --build build --target embeddable -- -k 0 # report every compile error, not just the first
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify binaries
