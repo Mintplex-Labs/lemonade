@@ -62,10 +62,11 @@ env:
   LEMONADE_DISABLE_SYSTEMD_JOURNAL: "1"
   # Highest glibc symbol version the Linux binaries may require (Ubuntu 22.04)
   MAX_GLIBC: "2.35"
-  # Resource files shipped next to lemond (same set the upstream embeddable target packs)
+  # Resource files shipped next to lemond. Upstream embeddable omits architecture_defaults.json (per model
+  # family sampler defaults) which lemond warns about, so it is added here.
   RESOURCES: >-
     defaults.json backend_versions.json server_models.json
-    toolDefinitions.json vllm_model_config.json bench_scenarios.json
+    toolDefinitions.json vllm_model_config.json bench_scenarios.json architecture_defaults.json
 
 jobs:
   # Turns the per-target checkboxes into a platform list per OS job; an OS job with nothing selected is
